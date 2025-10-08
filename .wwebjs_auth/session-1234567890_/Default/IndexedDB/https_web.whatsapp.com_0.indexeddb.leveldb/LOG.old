@@ -1,0 +1,36 @@
+2025/09/02-04:28:33.016 bd07 Reusing MANIFEST /Users/idokoagadajerry/Documents/my files/coded/Whatsapp-api/whapper/.wwebjs_auth/session-1234567890_/Default/IndexedDB/https_web.whatsapp.com_0.indexeddb.leveldb/MANIFEST-000001
+2025/09/02-04:28:33.017 bd07 Recovering log #2474
+2025/09/02-04:28:33.027 bd07 Reusing old log /Users/idokoagadajerry/Documents/my files/coded/Whatsapp-api/whapper/.wwebjs_auth/session-1234567890_/Default/IndexedDB/https_web.whatsapp.com_0.indexeddb.leveldb/002474.log 
+2025/09/02-04:28:35.841 17e03 Level-0 table #2486: started
+2025/09/02-04:28:35.853 17e03 Level-0 table #2486: 145259 bytes OK
+2025/09/02-04:28:35.857 17e03 Delete type=0 #2474
+2025/09/02-04:28:35.861 17e03 Manual compaction at level-0 from ' \x93\x01\x00\x00\x00' @ 72057594037927935 : 1 .. ' \x94\x01\x00\x00\x00' @ 0 : 0; will stop at (end)
+2025/09/02-04:28:35.862 1ee03 Level-0 table #2488: started
+2025/09/02-04:28:35.865 1ee03 Level-0 table #2488: 457 bytes OK
+2025/09/02-04:28:35.871 1ee03 Delete type=0 #2485
+2025/09/02-04:28:35.871 1ee03 Manual compaction at level-0 from ' \x94\x01\x00\x00\x00' @ 72057594037927935 : 1 .. ' \x95\x01\x00\x00\x00' @ 0 : 0; will stop at ' \x94\x01\x00\x00\x05' @ 2251168 : 0
+2025/09/02-04:28:35.872 1ee03 Compacting 1@0 + 1@1 files
+2025/09/02-04:28:35.879 1ee03 Generated table #2489@0: 3418 keys, 70099 bytes
+2025/09/02-04:28:35.879 1ee03 Compacted 1@0 + 1@1 files => 70099 bytes
+2025/09/02-04:28:35.885 1ee03 compacted to: files[ 0 1 7 0 0 0 0 ]
+2025/09/02-04:28:35.885 1ee03 Delete type=2 #2488
+2025/09/02-04:28:35.886 1ee03 Manual compaction at level-0 from ' \x94\x01\x00\x00\x05' @ 2251168 : 0 .. ' \x95\x01\x00\x00\x00' @ 0 : 0; will stop at (end)
+2025/09/02-04:28:37.161 1ee03 Compacting 1@1 + 7@2 files
+2025/09/02-04:28:37.229 1ee03 Generated table #2490@1: 85985 keys, 2235337 bytes
+2025/09/02-04:28:37.285 1ee03 Generated table #2491@1: 66532 keys, 2228621 bytes
+2025/09/02-04:28:37.341 1ee03 Generated table #2492@1: 19457 keys, 2179518 bytes
+2025/09/02-04:28:37.411 1ee03 Generated table #2493@1: 20554 keys, 2219105 bytes
+2025/09/02-04:28:37.478 1ee03 Generated table #2494@1: 23653 keys, 2155885 bytes
+2025/09/02-04:28:37.574 1ee03 Generated table #2495@1: 111967 keys, 2266032 bytes
+2025/09/02-04:28:37.623 1ee03 Generated table #2496@1: 64707 keys, 1309632 bytes
+2025/09/02-04:28:37.623 1ee03 Compacted 1@1 + 7@2 files => 14594130 bytes
+2025/09/02-04:28:37.632 1ee03 compacted to: files[ 0 0 7 0 0 0 0 ]
+2025/09/02-04:28:37.633 1ee03 Delete type=2 #2477
+2025/09/02-04:28:37.633 1ee03 Delete type=2 #2489
+2025/09/02-04:28:37.633 1ee03 Delete type=2 #2481
+2025/09/02-04:28:37.633 1ee03 Delete type=2 #2480
+2025/09/02-04:28:37.633 1ee03 Delete type=2 #2482
+2025/09/02-04:28:37.633 1ee03 Delete type=2 #2483
+2025/09/02-04:28:37.633 1ee03 Delete type=2 #2478
+2025/09/02-04:28:37.633 1ee03 Delete type=2 #2479
+2025/09/02-04:28:37.633 1ee03 Delete type=2 #2486
