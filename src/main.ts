@@ -2,6 +2,7 @@ import { NestFactory } from '@nestjs/core';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './modules/app.module';
 import { ValidationPipe } from '@nestjs/common';
+import { IoAdapter } from '@nestjs/platform-socket.io';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
@@ -63,7 +64,8 @@ async function bootstrap() {
   const document = SwaggerModule.createDocument(app, config);
   SwaggerModule.setup('api-docs', app, document);
 
-  const port = process.env.PORT || 3001;
+  const port = process.env.PORT || 3002;
+    app.useWebSocketAdapter(new IoAdapter(app));
   await app.listen(port)
     .then(() => console.log('LISTEN RESOLVED'))
     .catch(err => console.error('LISTEN FAILED', err));

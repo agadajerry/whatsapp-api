@@ -42,6 +42,7 @@ export class WhatsAppController {
   async connect(@Req() req: any, @Res() res: Response) {
     const userId = req.user.sub;
     const clientId = req.user.clientId;
+    console.log(clientId)
 
     await this.sessionService.initializeClient(clientId, userId);
 
@@ -83,7 +84,7 @@ export class WhatsAppController {
 
     console.log(clientId,"I am here")
 
-    await this.sessionService.deleteClient(clientId);
+    await this.sessionService.deleteSession(clientId);
 
     return {
       clientId,

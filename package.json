@@ -50,7 +50,8 @@
     "rxjs": "^7.8.1",
     "socket.io": "^4.7.0",
     "swagger-ui-express": "^5.0.1",
-    "whatsapp-web.js": "^1.31.0"
+    "whatsapp-web.js": "^1.31.0",
+    "wwebjs-mongo": "^1.1.0"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.2.0",

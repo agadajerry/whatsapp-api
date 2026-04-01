@@ -1,4 +1,3 @@
-
 import puppeteer from 'puppeteer-extra';
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 import * as fs from 'fs';
@@ -14,7 +13,8 @@ export const createPuppeteerConfig = (sessionPath: string) => {
     headless: true,
     executablePath: require('puppeteer').executablePath(),
     args: [
-      '--no-sandbox',
+    '--no-sandbox',
+    '--single-process',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-accelerated-2d-canvas',
@@ -27,6 +27,8 @@ export const createPuppeteerConfig = (sessionPath: string) => {
     ],
   };
 };
+
+
 
 export const applyPageOptimizations = async (page: any) => {
   await page.setUserAgent(

@@ -14,13 +14,14 @@ interface JwtPayload {
 }
 
 @WebSocketGateway({
+  namespace: '/chat-connect',
   cors: {
     origin: '*',
   },
-  transports: ['websocket'],
   // Add ping timeout to detect dead connections
   pingTimeout: 60000,
   pingInterval: 25000,
+   transports: ['websocket'],
 })
 export class SessionGateway
   implements OnGatewayConnection, OnGatewayDisconnect
@@ -104,10 +105,7 @@ export class SessionGateway
   ------------------------------------------------------ */
 
   emitSessionQr(userId: string, sessionId: string, qr: string) {
-    this.server.to(`user:${userId}`).emit('session.qr', {
-      sessionId,
-      qr,
-    });
+    this.emitToUser(userId, 'session:qr', { sessionId, qr });
   }
 
   emitSessionReady(userId: string, sessionId: string, phoneNumber: string) {
@@ -121,6 +119,10 @@ export class SessionGateway
     this.server.to(`user:${userId}`).emit('session.disconnected', {
       sessionId,
     });
+  }
+
+  emitToUser(userId: string, event: string, data: any) {
+    this.server.to(`user:${userId}`).emit(event, data);
   }
 
   emitAuthFailure(userId: string, sessionId: string) {
@@ -155,4 +157,6 @@ export class SessionGateway
       message,
     });
   }
+
+  
 }

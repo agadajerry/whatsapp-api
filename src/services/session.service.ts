@@ -1,28 +1,35 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { Client, LocalAuth, MessageMedia } from 'whatsapp-web.js';
-import * as fs from 'fs';
-import * as path from 'path';
+import { InjectConnection, InjectModel } from '@nestjs/mongoose';
+import { Connection, Model, Types } from 'mongoose';
+import { Client, RemoteAuth } from 'whatsapp-web.js';
+import { MongoStore } from 'wwebjs-mongo';
 import * as puppeteer from 'puppeteer';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
 import { HttpService } from '@nestjs/axios';
 
 import { Session, SessionDocument } from 'src/schema/session.schema';
 import { Message, MessageDocument } from 'src/schema/message.schema';
 import { Webhook, WebhookDocument } from 'src/schema/webhook.schema';
-import { WebhookService } from './webhook.service';
-import { signPayload } from 'src/utils/webhook-signature.util';
 import { SessionGateway } from 'src/ws/session-gateway';
-import { createPuppeteerConfig } from './puppeteer.factory';
+import { signPayload } from 'src/utils/webhook-signature.util';
 
 @Injectable()
 export class SessionService implements OnModuleInit {
   private readonly logger = new Logger(SessionService.name);
+
   private readonly runtimeClients = new Map<string, Client>();
-  private readonly SESSIONS_DIR = './sessions';
-  private readonly initializingClients = new Set<string>(); // Prevent duplicate initialization
+  private readonly initializing = new Set<string>();
+  private readonly processedMessages = new Set<string>();
+  private readonly healthIntervals = new Map<string, NodeJS.Timeout>();
+
+  private store: InstanceType<typeof MongoStore>;
+
+  private messageQueue: any[] = [];
+  private processingQueue = false;
 
   constructor(
+    @InjectConnection()
+    private readonly mongooseConnection: Connection,
+
     @InjectModel(Session.name)
     private readonly sessionModel: Model<SessionDocument>,
 
@@ -32,416 +39,356 @@ export class SessionService implements OnModuleInit {
     @InjectModel(Webhook.name)
     private readonly webhookModel: Model<WebhookDocument>,
 
-    private readonly webhookService: WebhookService,
     private readonly httpService: HttpService,
     private readonly gateway: SessionGateway,
-  ) {
-    this.ensureSessionsDirectory();
-  }
-
-  /* --------------------------------------------------------
-     APP BOOTSTRAP
-  ---------------------------------------------------------*/
+  ) {}
 
   async onModuleInit() {
-    this.logger.log('Restoring authenticated sessions...');
-
-    const sessions = await this.sessionModel.find({
-      isAuthenticated: true,
-    });
-
-    for (const session of sessions) {
-      try {
-        this.logger.log(`Restoring session ${session.sessionId}`);
-        await this.initializeClient(session.sessionId, session.userId);
-      } catch (error) {
-        this.logger.error(
-          `Failed to restore session ${session.sessionId}: ${error.message}`,
-        );
-
-        // Mark session as disconnected if restoration fails
-        await this.sessionModel.updateOne(
-          { sessionId: session.sessionId },
-          {
-            status: 'Disconnected',
-            isAuthenticated: false,
-            qrCode: null,
-          },
-        );
-      }
+    // 🔥 WAIT for connection to be ready
+    if (this.mongooseConnection.readyState !== 1) {
+      this.logger.log('⏳ Waiting for Mongo connection...');
+      await new Promise<void>((resolve) => {
+        this.mongooseConnection.once('connected', () => resolve());
+      });
     }
 
-    this.logger.log(
-      `Session restoration complete. Active: ${this.runtimeClients.size}`,
-    );
-  }
+this.store = new MongoStore({
+  mongoose: { connection: this.mongooseConnection } as any,
+});
 
-  private ensureSessionsDirectory() {
-    if (!fs.existsSync(this.SESSIONS_DIR)) {
-      fs.mkdirSync(this.SESSIONS_DIR, { recursive: true });
+    this.startQueueProcessor();
+
+    const sessions = await this.sessionModel.find({ isAuthenticated: true });
+
+    for (const s of sessions) {
+      this.initializeClient(s.sessionId, s.userId);
     }
   }
 
-  /* --------------------------------------------------------
+  /* =========================================================
      CLIENT INITIALIZATION
-  ---------------------------------------------------------*/
+  ========================================================= */
 
-  async initializeClient(
-    sessionId: string,
-    userId: Types.ObjectId,
-  ): Promise<void> {
-    // Prevent duplicate initialization
-    if (this.initializingClients.has(sessionId)) {
-      this.logger.warn(`Session ${sessionId} is already initializing`);
-      return;
-    }
+  async initializeClient(sessionId: string, userId: Types.ObjectId) {
+    if (this.initializing.has(sessionId)) return;
 
-    // Check if client already exists and is connected
-    if (this.runtimeClients.has(sessionId)) {
-      const existingClient: any = this.runtimeClients.get(sessionId);
-      const state = await existingClient.getState();
-
-      if (state === 'CONNECTED') {
-        this.logger.warn(`Session ${sessionId} is already connected`);
-        return;
-      } else {
-        // Client exists but not connected, clean it up
-        this.logger.warn(`Cleaning up stale client for ${sessionId}`);
-        try {
-          await existingClient.destroy();
-        } catch (err) {
-          this.logger.warn(`Error destroying stale client: ${err.message}`);
-        }
-        this.runtimeClients.delete(sessionId);
-      }
-    }
-
-    this.initializingClients.add(sessionId);
+    this.initializing.add(sessionId);
 
     try {
-      let session = await this.sessionModel.findOne({ sessionId });
-
-      if (!session) {
-        session = await this.sessionModel.create({
-          sessionId,
-          userId,
-          status: 'Initializing',
-          isAuthenticated: false,
-        });
-      } else {
-        await this.sessionModel.updateOne(
-          { sessionId },
-          { status: 'Initializing', qrCode: null },
-        );
-      }
-
-      const sessionDataPath = path.join(
-        this.SESSIONS_DIR,
-        `session-${sessionId}`,
-      );
-
-      const puppeteerConfig = createPuppeteerConfig(sessionDataPath);
-
       const client = new Client({
-        authStrategy: new LocalAuth({
-          dataPath: sessionDataPath,
+        authStrategy: new RemoteAuth({
           clientId: sessionId,
+          store: this.store,
+          backupSyncIntervalMs: 300000,
         }),
 
-        puppeteer: puppeteerConfig,
-
-        webVersionCache: {
-          type: 'none',
+        puppeteer: {
+          headless: true,
+          executablePath: puppeteer.executablePath(),
+          args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+          ],
         },
       });
-      
-      this.monitorClientHealth(client, sessionId);
 
+      this.bindEvents(client, sessionId, userId.toString());
       this.runtimeClients.set(sessionId, client);
-      this.setupClientEvents(client, sessionId, userId, sessionDataPath);
 
-      await client.initialize();
+      await this.updateSession(sessionId, { status: 'INITIALIZING' });
 
-      client.on('ready', async () => {
-        this.logger.log(`✓ Session ${sessionId} is ready`);
+      // ✅ Prevent hanging init
+      await Promise.race([
+        client.initialize(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Init timeout')), 60000),
+        ),
+      ]);
 
-        // 🔥 Access Puppeteer Page
-        const browser = await (client as any).pupBrowser;
-        const pages = await browser.pages();
-        const page = pages[0];
+      this.logger.log(`✓ Initialized ${sessionId}`);
+    } catch (err) {
+      this.logger.error(`Init failed ${sessionId}`, err);
 
-        // Apply optimizations
-        await page.setUserAgent(
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-            '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        );
-
-        // Optional: block heavy resources
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-          if (['image', 'stylesheet', 'font'].includes(req.resourceType())) {
-            req.abort();
-          } else {
-            req.continue();
-          }
-        });
-
-        const phoneNumber = client.info?.wid?.user ?? '';
-
-        await this.sessionModel.updateOne(
-          { sessionId },
-          {
-            status: 'Connected',
-            phoneNumber,
-            qrCode: null,
-            isAuthenticated: true,
-          },
-        );
-
-        this.gateway.emitSessionReady(
-          userId.toString(),
-          sessionId,
-          phoneNumber,
-        );
+      await this.updateSession(sessionId, {
+        status: 'FAILED',
+        isAuthenticated: false,
       });
 
-      this.logger.log(`✓ Client initialized for session ${sessionId}`);
-    } catch (error) {
-      this.logger.error(
-        `Failed to initialize client for ${sessionId}: ${error.message}`,
-        error.stack,
-      );
-
-      // Clean up on failure
       this.runtimeClients.delete(sessionId);
-
-      await this.sessionModel.updateOne(
-        { sessionId },
-        {
-          status: 'Initialization Failed',
-          isAuthenticated: false,
-          qrCode: null,
-        },
-      );
-
-      throw error;
     } finally {
-      this.initializingClients.delete(sessionId);
+      this.initializing.delete(sessionId);
     }
   }
 
-  private setupClientEvents(
-    client: Client,
-    sessionId: string,
-    userId: Types.ObjectId,
-    sessionDataPath: string,
-  ) {
-    /* ---------------- QR CODE EVENT ---------------- */
+  /* =========================================================
+     EVENTS
+  ========================================================= */
+
+  private bindEvents(client: Client, sessionId: string, userId: string) {
+    client.removeAllListeners();
 
     client.on('qr', async (qr) => {
-      this.logger.log(`QR code generated for ${sessionId}`);
-
-      await this.sessionModel.updateOne(
-        { sessionId },
-        { status: 'QR Code Generated', qrCode: qr },
-      );
-
-      this.gateway.emitSessionQr(userId.toString(), sessionId, qr);
+      await this.updateSession(sessionId, { status: 'QR', qrCode: qr });
+      this.gateway.emitSessionQr(userId, sessionId, qr);
     });
-
-    /* ---------------- READY EVENT ---------------- */
-
-    client.on('ready', async () => {
-      this.logger.log(`✓ Session ${sessionId} is ready`);
-
-      const phoneNumber = client.info?.wid?.user ?? '';
-
-      await this.sessionModel.updateOne(
-        { sessionId },
-        {
-          status: 'Connected',
-          phoneNumber,
-          qrCode: null,
-          isAuthenticated: true,
-        },
-      );
-
-      this.gateway.emitSessionReady(userId.toString(), sessionId, phoneNumber);
-    });
-
-    /* ---------------- AUTHENTICATED EVENT ---------------- */
 
     client.on('authenticated', async () => {
-      this.logger.log(`✓ Session ${sessionId} authenticated`);
-
-      await this.sessionModel.updateOne(
-        { sessionId },
-        { isAuthenticated: true },
-      );
+      await this.updateSession(sessionId, { status: 'AUTHENTICATED' });
     });
 
-    /* ---------------- AUTH FAILURE EVENT ---------------- */
-
-    client.on('auth_failure', async (msg) => {
-      this.logger.error(`✗ Auth failure for ${sessionId}: ${msg}`);
-
-      await this.sessionModel.updateOne(
-        { sessionId },
-        {
-          status: 'Authentication Failure',
-          isAuthenticated: false,
-          qrCode: null,
-        },
-      );
-
-      this.gateway.emitAuthFailure(userId.toString(), sessionId);
-
-      // Clean up session data
-      if (fs.existsSync(sessionDataPath)) {
-        fs.rmSync(sessionDataPath, { recursive: true, force: true });
-      }
-
-      this.runtimeClients.delete(sessionId);
-
-      // Attempt to destroy client
-      try {
-        await client.destroy();
-      } catch (err) {
-        this.logger.warn(
-          `Error destroying client after auth failure: ${err.message}`,
-        );
-      }
+    client.on('remote_session_saved', () => {
+      this.logger.log(`☁️ Session persisted: ${sessionId}`);
     });
 
-    /* ---------------- DISCONNECTED EVENT ---------------- */
+    client.on('ready', async () => {
+      const phone = client.info?.wid?.user;
 
-    client.on('disconnected', async (reason) => {
-      this.logger.warn(`✗ Session ${sessionId} disconnected: ${reason}`);
-
-      await this.sessionModel.updateOne(
-        { sessionId },
-        {
-          status: 'Disconnected',
-          isAuthenticated: false,
-          qrCode: null,
-          phoneNumber: null,
-        },
-      );
-
-      this.gateway.emitSessionDisconnected(userId.toString(), sessionId);
-
-      this.runtimeClients.delete(sessionId);
-
-      try {
-        await client.destroy();
-      } catch (err) {
-        this.logger.warn(
-          `Error destroying disconnected client: ${err.message}`,
-        );
-      }
-    });
-
-    /* ---------------- MESSAGE EVENT ---------------- */
-
-    client.on('message', (msg) =>
-      this.handleIncomingMessage(sessionId, userId, msg),
-    );
-
-    /* ---------------- LOADING SCREEN EVENT (optional) ---------------- */
-
-    client.on('loading_screen', (percent, message) => {
-      this.logger.debug(`Loading ${sessionId}: ${percent}% - ${message}`);
-    });
-  }
-
-  async disconnectClient(sessionId: string): Promise<void> {
-    const session = await this.sessionModel.findOne({ sessionId });
-
-    console.log(sessionId);
-
-    if (!session) {
-      throw new Error(`Session ${sessionId} not found`);
-    }
-
-    const client = this.runtimeClients.get(sessionId);
-    console.log(client, 'client');
-
-    if (client) {
-      try {
-        await client.logout();
-        await client.destroy();
-        this.logger.log(`✓ Client ${sessionId} logged out and destroyed`);
-      } catch (err) {
-        this.logger.warn(
-          `Error while destroying client ${sessionId}: ${err.message}`,
-        );
-      }
-      this.runtimeClients.delete(sessionId);
-    }
-
-    // Remove local auth data
-    const sessionDataPath = path.join(
-      this.SESSIONS_DIR,
-      `session-${sessionId}`,
-    );
-
-    if (fs.existsSync(sessionDataPath)) {
-      fs.rmSync(sessionDataPath, { recursive: true, force: true });
-      this.logger.log(`✓ Removed session data for ${sessionId}`);
-    }
-
-    await this.sessionModel.updateOne(
-      { sessionId },
-      {
-        status: 'Disconnected',
-        isAuthenticated: false,
+      await this.updateSession(sessionId, {
+        status: 'READY',
+        phoneNumber: phone,
+        isAuthenticated: true,
         qrCode: null,
-        phoneNumber: null,
-      },
-    );
+      });
 
-    this.gateway.emitSessionDisconnected(session.userId.toString(), sessionId);
-    this.logger.log(`✓ Session ${sessionId} disconnected manually`);
+      this.gateway.emitSessionReady(userId, sessionId, phone);
+      this.startHealthMonitor(client, sessionId, userId);
+    });
+
+    client.on('disconnected', () => this.handleDisconnect(sessionId, userId));
+
+    client.on('auth_failure', () => this.handleAuthFailure(sessionId, userId));
+
+    client.on('message', (msg) => this.enqueueMessage(sessionId, userId, msg));
   }
 
-  async deleteClient(sessionId: string): Promise<void> {
+  /* =========================================================
+     QUEUE (SAFE DRAIN)
+  ========================================================= */
+
+  private enqueueMessage(sessionId: string, userId: string, msg: any) {
+    if (msg.fromMe) return;
+    this.messageQueue.push({ sessionId, userId, msg });
+  }
+
+  private startQueueProcessor() {
+    setInterval(async () => {
+      if (this.processingQueue) return;
+
+      this.processingQueue = true;
+
+      while (this.messageQueue.length) {
+        const job = this.messageQueue.shift();
+        try {
+          await this.processMessage(job);
+        } catch (err) {
+          this.logger.error('Queue error', err);
+        }
+      }
+
+      this.processingQueue = false;
+    }, 500);
+  }
+
+  private async processMessage(job: any) {
+    const { sessionId, userId, msg } = job;
+
+    const id = msg.id?._serialized;
+    if (!id || this.processedMessages.has(id)) return;
+
+    this.processedMessages.add(id);
+
+    const saved = await this.messageModel.create({
+      clientId: sessionId,
+      from: msg.from,
+      to: msg.to,
+      body: msg.body,
+      messageId: id,
+      timestamp: new Date(msg.timestamp * 1000),
+    });
+
+    this.gateway.emitIncomingMessage(userId, sessionId, saved);
+    await this.dispatchWebhook(sessionId, saved);
+  }
+
+  /* =========================================================
+     WEBHOOK
+  ========================================================= */
+
+  private async dispatchWebhook(sessionId: string, message: any) {
+    const webhook: any = await this.webhookModel.findOne({
+      clientId: sessionId,
+      enabled: true,
+    });
+
+    if (!webhook) return;
+
+    const payload = { event: 'message.received', data: message };
+    const signature = signPayload(payload, webhook.secret);
+
+    for (let i = 0; i < 5; i++) {
+      try {
+        await this.httpService.axiosRef.post(webhook.url, payload, {
+          headers: { 'X-Webhook-Signature': signature },
+          timeout: 5000,
+        });
+        return;
+      } catch {
+        await new Promise((r) => setTimeout(r, 2000 * (i + 1)));
+      }
+    }
+  }
+
+  /* =========================================================
+     HEALTH
+  ========================================================= */
+
+  private startHealthMonitor(
+    client: Client,
+    sessionId: string,
+    userId: string,
+  ) {
+    const existing = this.healthIntervals.get(sessionId);
+    if (existing) clearInterval(existing);
+
+    const interval = setInterval(async () => {
+      try {
+        const state = await client.getState();
+        if (state !== 'CONNECTED') {
+          this.logger.warn(`⚠️ ${sessionId} unstable: ${state}`);
+        }
+      } catch {
+        this.logger.error(`💥 Crash: ${sessionId}`);
+        clearInterval(interval);
+        this.healthIntervals.delete(sessionId);
+        await this.recover(sessionId, userId);
+      }
+    }, 20000);
+
+    this.healthIntervals.set(sessionId, interval);
+  }
+
+  private async recover(sessionId: string, userId: string) {
+    this.runtimeClients.delete(sessionId);
+
+    await this.updateSession(sessionId, { status: 'DISCONNECTED' });
+
+    setTimeout(() => {
+      this.initializeClient(sessionId, new Types.ObjectId(userId));
+    }, 10000);
+  }
+
+  private async handleDisconnect(sessionId: string, userId: string) {
+    this.clearHealth(sessionId);
+
+    await this.updateSession(sessionId, {
+      status: 'DISCONNECTED',
+      isAuthenticated: false,
+    });
+
+    this.gateway.emitSessionDisconnected(userId, sessionId);
+    this.runtimeClients.delete(sessionId);
+  }
+
+  private async handleAuthFailure(sessionId: string, userId: string) {
+    this.clearHealth(sessionId);
+
+    await this.updateSession(sessionId, {
+      status: 'FAILED',
+      isAuthenticated: false,
+    });
+
+    this.runtimeClients.delete(sessionId);
+  }
+
+  private clearHealth(sessionId: string) {
+    const interval = this.healthIntervals.get(sessionId);
+    if (interval) {
+      clearInterval(interval);
+      this.healthIntervals.delete(sessionId);
+    }
+  }
+
+  /* =========================================================
+     SEND
+  ========================================================= */
+
+  async sendMessage(sessionId: string, to: string, text: string) {
+    const client = this.runtimeClients.get(sessionId);
+    if (!client) throw new Error('Client not found');
+
+    return client.sendMessage(`${to}@c.us`, text);
+  }
+
+  /* =========================================================
+     DISCONNECT
+  ========================================================= */
+
+  async disconnectClient(sessionId: string) {
+    const client = this.runtimeClients.get(sessionId);
+
+    if (client) {
+      await client.logout();
+      await client.destroy();
+      this.runtimeClients.delete(sessionId);
+    }
+
+    await this.updateSession(sessionId, {
+      status: 'DISCONNECTED',
+      isAuthenticated: false,
+    });
+  }
+
+  /* =========================================================
+     UTIL
+  ========================================================= */
+
+  private async updateSession(sessionId: string, patch: any) {
+    await this.sessionModel.updateOne({ sessionId }, patch);
+  }
+
+  async getAllSessions(userId: Types.ObjectId): Promise<Session[]> {
+    return this.sessionModel
+      .find({ userId, status: { $ne: 'DELETED' } })
+      .exec();
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
     const session = await this.sessionModel.findOne({ sessionId });
-
-    console.log(session);
-
     if (!session) {
       throw new Error(`Session ${sessionId} not found`);
     }
 
     const client = this.runtimeClients.get(sessionId);
 
+    // 1. Stop client safely
     if (client) {
       try {
-        await client.logout();
+        await client.logout(); // removes remote auth session internally
         await client.destroy();
-        this.logger.log(`✓ Client ${sessionId} logged out and destroyed`);
+        this.logger.log(`✓ Client ${sessionId} destroyed`);
       } catch (err) {
-        this.logger.warn(
-          `Error while destroying client ${sessionId}: ${err.message}`,
-        );
+        this.logger.warn(`Destroy error ${sessionId}: ${err.message}`);
       }
+
       this.runtimeClients.delete(sessionId);
     }
 
-    // Remove local auth data
-    const sessionDataPath = path.join(
-      this.SESSIONS_DIR,
-      `session-${sessionId}`,
-    );
-
-    if (fs.existsSync(sessionDataPath)) {
-      fs.rmSync(sessionDataPath, { recursive: true, force: true });
-      this.logger.log(`✓ Removed session data for ${sessionId}`);
+    // 2. Explicitly delete from Mongo store (IMPORTANT)
+    try {
+      await this.store.delete({ session: sessionId });
+      this.logger.log(`🗑️ RemoteAuth session deleted from Mongo: ${sessionId}`);
+    } catch (err) {
+      this.logger.warn(`Store delete failed ${sessionId}: ${err.message}`);
     }
 
+    // 3. Release distributed lock (if using it)
     await this.sessionModel.updateOne(
       { sessionId },
       {
+        ownerId: null,
+        lockUntil: null,
         status: 'DELETED',
         isAuthenticated: false,
         qrCode: null,
@@ -450,220 +397,7 @@ export class SessionService implements OnModuleInit {
     );
 
     this.gateway.emitSessionDisconnected(session.userId.toString(), sessionId);
-    this.logger.log(`✓ Session ${sessionId} disconnected manually`);
-  }
-  /* --------------------------------------------------------
-     RECEIVE MESSAGE
-  ---------------------------------------------------------*/
 
-  private async handleIncomingMessage(
-    sessionId: string,
-    userId: Types.ObjectId,
-    msg: any,
-  ) {
-    try {
-      if (msg.fromMe) return;
-
-      console.log(msg);
-
-      const savedMessage = await this.messageModel.create({
-        clientId: sessionId,
-        from: msg.from,
-        to: msg.to,
-        body: msg.body,
-        messageId: msg.id?._serialized,
-        timestamp: new Date(msg.timestamp * 1000),
-        type: msg.type,
-      });
-
-      this.gateway.emitIncomingMessage(userId.toString(), sessionId, {
-        id: savedMessage.id,
-        from: savedMessage.from,
-        to: savedMessage.to,
-        body: savedMessage.body,
-        type: savedMessage.type,
-        timestamp: savedMessage.createdAt,
-      });
-
-      const webhook = await this.webhookModel.findOne({
-        clientId: sessionId,
-        enabled: true,
-        events: 'message.received',
-      });
-
-      // console.log(webhook);
-
-      if (webhook) {
-        const payload = {
-          event: 'message.received',
-          sessionId,
-          data: {
-            id: savedMessage.id,
-            from: savedMessage.from,
-            to: savedMessage.to,
-            body: savedMessage.body,
-            type: savedMessage.type,
-            timestamp: savedMessage.createdAt,
-          },
-        };
-
-        this.deliverWebhook(webhook, payload);
-      }
-    } catch (error) {
-      this.logger.error(
-        `Failed to process incoming message for ${sessionId}: ${error.message}`,
-        error.stack,
-      );
-    }
-  }
-
-  private async deliverWebhook(webhook: any, payload: any) {
-    const signature = signPayload(payload, webhook.secret + 'nkkn');
-
-    try {
-      await this.httpService.axiosRef.post(
-        'http://localhost:3001/api/test/webhook',
-        payload,
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Webhook-Signature': `sha256=${signature}`,
-          },
-          timeout: 5000,
-        },
-      );
-
-      this.logger.log(`✓ Webhook delivered to ${webhook.url}`);
-    } catch (err) {
-      this.logger.warn(`✗ Webhook delivery failed: ${err.message}`);
-    }
-  }
-
-  /* --------------------------------------------------------
-     SEND MESSAGE
-  ---------------------------------------------------------*/
-
-  async sendMessage(sessionId: string, to: string, message: string) {
-    const session = await this.sessionModel.findOne({ sessionId });
-
-    if (!session || session.status !== 'Connected') {
-      throw new Error(`Session ${sessionId} is not connected`);
-    }
-
-    const client = this.runtimeClients.get(sessionId);
-
-    if (!client) {
-      throw new Error(`Client not loaded in memory for ${sessionId}`);
-    }
-
-    const chatId = `${to.replace('+', '')}@c.us`;
-    const msg = await client.sendMessage(chatId, message);
-
-    this.gateway.emitMessageSent(
-      session.userId.toString(),
-      sessionId,
-      msg.id._serialized,
-    );
-
-    return msg;
-  }
-
-  /* --------------------------------------------------------
-     SEND ATTACHMENT
-  ---------------------------------------------------------*/
-
-  async sendAttachment(
-    sessionId: string,
-    to: string,
-    file: string,
-    caption?: string,
-    type?: string,
-  ) {
-    const session = await this.sessionModel.findOne({ sessionId });
-
-    if (!session || session.status !== 'Connected') {
-      throw new Error(`Session ${sessionId} is not connected`);
-    }
-
-    const client = this.runtimeClients.get(sessionId);
-
-    if (!client) {
-      throw new Error(`Client not loaded in memory for ${sessionId}`);
-    }
-
-    let media: MessageMedia;
-
-    if (fs.existsSync(file)) {
-      media = MessageMedia.fromFilePath(file);
-    } else if (file.startsWith('http')) {
-      media = await MessageMedia.fromUrl(file, { unsafeMime: true });
-    } else {
-      if (!type) {
-        throw new Error('Attachment type is required for base64 files');
-      }
-      const base64 = file.includes(',') ? file.split(',')[1] : file;
-      media = new MessageMedia(type, base64);
-    }
-
-    const chatId = `${to.replace('+', '')}@c.us`;
-    const msg = await client.sendMessage(chatId, media, { caption });
-
-    this.gateway.emitMessageSent(
-      session.userId.toString(),
-      sessionId,
-      msg.id._serialized,
-    );
-
-    return msg;
-  }
-
-  /* --------------------------------------------------------
-     UTILITY METHODS
-  ---------------------------------------------------------*/
-
-  async getSessionStatus(sessionId: string) {
-    const session = await this.sessionModel.findOne({ sessionId });
-    const client = this.runtimeClients.get(sessionId);
-
-    let clientState = 'NOT_LOADED';
-
-    if (client) {
-      try {
-        clientState = await client.getState();
-      } catch (err) {
-        clientState = 'ERROR';
-      }
-    }
-
-    return {
-      session: session?.toObject(),
-      clientState,
-      isInMemory: this.runtimeClients.has(sessionId),
-    };
-  }
-
-  async getAllSessions(userId: Types.ObjectId) {
-    return this.sessionModel.find({ userId }).exec();
-  }
-
-  private monitorClientHealth(client: Client, sessionId: string) {
-    setInterval(async () => {
-      try {
-        const state = await client.getState();
-
-        if (state !== 'CONNECTED') {
-          this.logger.warn(`⚠️ Session ${sessionId} unstable: ${state}`);
-        }
-      } catch (err) {
-        this.logger.error(`💥 Client crash detected: ${sessionId}`);
-
-        this.runtimeClients.delete(sessionId);
-
-        this.sessionModel.updateOne(
-          { sessionId },
-          { status: 'Crashed', isAuthenticated: false },
-        );
-      }
-    }, 15000);
+    this.logger.log(`✅ Session ${sessionId} fully deleted`);
   }
 }
