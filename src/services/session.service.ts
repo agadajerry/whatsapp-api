@@ -1,9 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectConnection, InjectModel } from '@nestjs/mongoose';
 import { Connection, Model, Types } from 'mongoose';
-import { Client, RemoteAuth } from 'whatsapp-web.js';
-import { MongoStore } from 'wwebjs-mongo';
-import * as puppeteer from 'puppeteer';
+import { Client, LocalAuth } from 'whatsapp-web.js';
 import { HttpService } from '@nestjs/axios';
 
 import { Session, SessionDocument } from 'src/schema/session.schema';
@@ -11,7 +9,9 @@ import { Message, MessageDocument } from 'src/schema/message.schema';
 import { Webhook, WebhookDocument } from 'src/schema/webhook.schema';
 import { SessionGateway } from 'src/ws/session-gateway';
 import { signPayload } from 'src/utils/webhook-signature.util';
-
+import * as path from 'path';
+import * as fs from 'fs';
+import { createPuppeteerConfig } from './puppeteer.factory';
 @Injectable()
 export class SessionService implements OnModuleInit {
   private readonly logger = new Logger(SessionService.name);
@@ -21,10 +21,9 @@ export class SessionService implements OnModuleInit {
   private readonly processedMessages = new Set<string>();
   private readonly healthIntervals = new Map<string, NodeJS.Timeout>();
 
-  private store: InstanceType<typeof MongoStore>;
-
   private messageQueue: any[] = [];
   private processingQueue = false;
+  private readonly SESSIONS_DIR = './sessions';
 
   constructor(
     @InjectConnection()
@@ -41,28 +40,44 @@ export class SessionService implements OnModuleInit {
 
     private readonly httpService: HttpService,
     private readonly gateway: SessionGateway,
-  ) {}
+  ) {
+    this.ensureSessionsDirectory();
+  }
 
-  async onModuleInit() {
-    // 🔥 WAIT for connection to be ready
-    if (this.mongooseConnection.readyState !== 1) {
-      this.logger.log('⏳ Waiting for Mongo connection...');
-      await new Promise<void>((resolve) => {
-        this.mongooseConnection.once('connected', () => resolve());
-      });
+  private ensureSessionsDirectory() {
+    if (!fs.existsSync(this.SESSIONS_DIR)) {
+      fs.mkdirSync(this.SESSIONS_DIR, { recursive: true });
     }
-
-this.store = new MongoStore({
-  mongoose: { connection: this.mongooseConnection } as any,
-});
+  }
+  async onModuleInit() {
+    // ✅ Removed: MongoStore initialization — not needed for LocalAuth
 
     this.startQueueProcessor();
 
     const sessions = await this.sessionModel.find({ isAuthenticated: true });
 
     for (const s of sessions) {
-      this.initializeClient(s.sessionId, s.userId);
+      try {
+        await this.initializeClient(s.sessionId, s.userId);
+      } catch (error) {
+        this.logger.error(
+          `Failed to restore session ${sessions}: ${error.message}`,
+        );
+
+        // Mark session as disconnected if restoration fails
+        await this.sessionModel.updateOne(
+          { sessionId: sessions },
+          {
+            status: 'Disconnected',
+            isAuthenticated: false,
+            qrCode: null,
+          },
+        );
+      }
     }
+    this.logger.log(
+      `Session restoration complete. Active: ${this.runtimeClients.size}`,
+    );
   }
 
   /* =========================================================
@@ -72,25 +87,61 @@ this.store = new MongoStore({
   async initializeClient(sessionId: string, userId: Types.ObjectId) {
     if (this.initializing.has(sessionId)) return;
 
+    if (this.runtimeClients.has(sessionId)) {
+      const existingClient: any = this.runtimeClients.get(sessionId);
+      const state = await existingClient.getState();
+
+      if (state === 'CONNECTED') {
+        this.logger.warn(`Session ${sessionId} is already connected`);
+        return;
+      } else {
+        // Client exists but not connected, clean it up
+        this.logger.warn(`Cleaning up stale client for ${sessionId}`);
+        try {
+          await existingClient.destroy();
+        } catch (err) {
+          this.logger.warn(`Error destroying stale client: ${err.message}`);
+        }
+        this.runtimeClients.delete(sessionId);
+      }
+    }
+
     this.initializing.add(sessionId);
 
+    let session = await this.sessionModel.findOne({ sessionId });
+
+    if (!session) {
+      session = await this.sessionModel.create({
+        sessionId,
+        userId,
+        status: 'Initializing',
+        isAuthenticated: false,
+      });
+    } else {
+      await this.sessionModel.updateOne(
+        { sessionId },
+        { status: 'Initializing', qrCode: null },
+      );
+    }
+
+    const sessionDataPath = path.join(
+      this.SESSIONS_DIR,
+      `session-${sessionId}`,
+    );
+
     try {
+      const puppeteerConfig = createPuppeteerConfig(sessionDataPath);
+
       const client = new Client({
-        authStrategy: new RemoteAuth({
+        authStrategy: new LocalAuth({
+          dataPath: sessionDataPath,
           clientId: sessionId,
-          store: this.store,
-          backupSyncIntervalMs: 300000,
         }),
 
-        puppeteer: {
-          headless: true,
-          executablePath: puppeteer.executablePath(),
-          args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-          ],
+        puppeteer: puppeteerConfig,
+
+        webVersionCache: {
+          type: 'none',
         },
       });
 
@@ -99,17 +150,38 @@ this.store = new MongoStore({
 
       await this.updateSession(sessionId, { status: 'INITIALIZING' });
 
-      // ✅ Prevent hanging init
+      // ✅ Add this block here
+      const page = (client as any).pupPage;
+      if (page) {
+        page.on('pageerror', (err: Error) => {
+          this.logger.error(`[${sessionId}] Page error: ${err.message}`);
+        });
+        page.on('console', (msg: any) => {
+          if (msg.type() === 'error') {
+            this.logger.error(`[${sessionId}] Console error: ${msg.text()}`);
+          }
+        });
+      }
+
       await Promise.race([
         client.initialize(),
         new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Init timeout')), 60000),
+          setTimeout(() => reject(new Error('Init timeout')), 300000),
         ),
       ]);
-
-      this.logger.log(`✓ Initialized ${sessionId}`);
     } catch (err) {
       this.logger.error(`Init failed ${sessionId}`, err);
+
+      const orphanedClient = this.runtimeClients.get(sessionId);
+      if (orphanedClient) {
+        try {
+          await orphanedClient.destroy();
+        } catch (destroyErr) {
+          this.logger.warn(
+            `Failed to destroy orphaned client: ${destroyErr.message}`,
+          );
+        }
+      }
 
       await this.updateSession(sessionId, {
         status: 'FAILED',
@@ -129,36 +201,52 @@ this.store = new MongoStore({
   private bindEvents(client: Client, sessionId: string, userId: string) {
     client.removeAllListeners();
 
+    // ✅ Catch any puppeteer page errors
+    client.on('loading_screen', (percent, message) => {
+      this.logger.log(`[${sessionId}] Loading ${percent}% — ${message}`);
+    });
+
     client.on('qr', async (qr) => {
+      this.logger.log(`[${sessionId}] QR received`);
       await this.updateSession(sessionId, { status: 'QR', qrCode: qr });
       this.gateway.emitSessionQr(userId, sessionId, qr);
     });
 
     client.on('authenticated', async () => {
+      this.logger.log(`[${sessionId}] ✅ Authenticated`);
+        this.gateway.emitSessionAuthenticated(userId, sessionId);
       await this.updateSession(sessionId, { status: 'AUTHENTICATED' });
     });
 
-    client.on('remote_session_saved', () => {
-      this.logger.log(`☁️ Session persisted: ${sessionId}`);
+    client.on('auth_failure', (msg) => {
+      this.gateway.emitAuthFailure(userId, sessionId);
+      this.logger.error(`[${sessionId}] ❌ Auth failure: ${msg}`);
+      this.handleAuthFailure(sessionId, userId);
+    });
+
+    client.on('change_state', (state) => {
+      // ✅ This fires on every internal WA state transition — key for debugging
+      this.logger.log(`[${sessionId}] State → ${state}`);
     });
 
     client.on('ready', async () => {
+      this.logger.log(`[${sessionId}] 🟢 Ready`);
       const phone = client.info?.wid?.user;
-
       await this.updateSession(sessionId, {
         status: 'READY',
         phoneNumber: phone,
         isAuthenticated: true,
         qrCode: null,
       });
-
       this.gateway.emitSessionReady(userId, sessionId, phone);
       this.startHealthMonitor(client, sessionId, userId);
     });
 
-    client.on('disconnected', () => this.handleDisconnect(sessionId, userId));
-
-    client.on('auth_failure', () => this.handleAuthFailure(sessionId, userId));
+    client.on('disconnected', (reason) => {
+      // ✅ reason tells you WHY it dropped
+      this.logger.warn(`[${sessionId}] Disconnected: ${reason}`);
+      this.handleDisconnect(sessionId, userId);
+    });
 
     client.on('message', (msg) => this.enqueueMessage(sessionId, userId, msg));
   }
@@ -281,6 +369,10 @@ this.store = new MongoStore({
 
   private async handleDisconnect(sessionId: string, userId: string) {
     this.clearHealth(sessionId);
+    const client = this.runtimeClients.get(sessionId);
+    if (client) {
+      await client.destroy();
+    }
 
     await this.updateSession(sessionId, {
       status: 'DISCONNECTED',
@@ -293,6 +385,10 @@ this.store = new MongoStore({
 
   private async handleAuthFailure(sessionId: string, userId: string) {
     this.clearHealth(sessionId);
+    const client = this.runtimeClients.get(sessionId);
+    if (client) {
+      await client.destroy();
+    }
 
     await this.updateSession(sessionId, {
       status: 'FAILED',
@@ -375,10 +471,8 @@ this.store = new MongoStore({
       this.runtimeClients.delete(sessionId);
     }
 
-    // 2. Explicitly delete from Mongo store (IMPORTANT)
     try {
-      await this.store.delete({ session: sessionId });
-      this.logger.log(`🗑️ RemoteAuth session deleted from Mongo: ${sessionId}`);
+      // await this.store.delete({ session: sessionId });
     } catch (err) {
       this.logger.warn(`Store delete failed ${sessionId}: ${err.message}`);
     }

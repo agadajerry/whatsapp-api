@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  mongo:
+    image: mongo:6
+    container_name: whatsapp-mongo
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  app:
+    build: .
+    container_name: whatsapp-app
+    restart: always
+    depends_on:
+      - mongo
+    environment:
+      MONGO_URI: mongodb://mongo:27017/whatsapp
+    ports:
+      - "3002:3002"
+
+volumes:
+  mongo_data:

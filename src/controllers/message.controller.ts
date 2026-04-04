@@ -29,9 +29,9 @@ import {
   SendMessageDto,
   SendQueryDto,
 } from 'src/dto/whatsapp.dto';
-import { SessionService } from '../services/session.service';
 import { JwtAuthGuard } from 'src/auth/jwt-auth.guard';
 import { Request } from 'express';
+import { SessionService } from 'src/services/session.service';
 
 @ApiTags('Messaging')
 @Controller('api')
